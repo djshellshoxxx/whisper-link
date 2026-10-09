@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>whisper-link</title>
+<meta name="description" content="Temporary end-to-end encrypted chat between two people. No server, no accounts, nothing stored.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%92%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1>whisper-link</h1>
+  <p class="tag">Temporary, end-to-end encrypted chat for two. No server, no account, nothing stored.</p>
+</header>
+
+<main>
+  <noscript><p class="banner error">This app needs JavaScript.</p></noscript>
+  <p id="unsupported" class="banner error" hidden>
+    This browser can't run whisper-link. It needs WebRTC and the Web Crypto API, and the page must be served over HTTPS.
+  </p>
+
+  <!-- 1. START -->
+  <section id="screen-start" class="card">
+    <h2>Start a private chat</h2>
+    <p>You and the other person swap two short codes (by email, text, or any messenger). After that your browsers connect directly to each other.</p>
+
+    <div class="row">
+      <label for="expiry">Auto-end and wipe the chat after</label>
+      <select id="expiry">
+        <option value="10">10 minutes</option>
+        <option value="30" selected>30 minutes</option>
+        <option value="60">1 hour</option>
+        <option value="120">2 hours</option>
+        <option value="0">No time limit</option>
+      </select>
+    </div>
+
+    <label class="check">
+      <input type="checkbox" id="use-stun" checked>
+      <span>Use public STUN servers (needed when you are on different networks). This tells Google and Cloudflare your IP address. Untick it for same-network chats only.</span>
+    </label>
+
+    <div class="buttons">
+      <button id="btn-host" class="primary" type="button">I'm starting the chat</button>
+      <button id="btn-join" type="button">I received an invite code</button>
+    </div>
+  </section>
+
+  <!-- 2a. HOST -->
+  <section id="screen-host" class="card" hidden>
+    <h2>Start a chat</h2>
+
+    <h3>Step 1: send your invite code</h3>
+    <p>Send this code to the other person.</p>
+    <textarea id="invite-out" readonly rows="5" spellcheck="false" aria-label="Your invite code"></textarea>
+    <div class="buttons">
+      <button id="copy-invite" type="button">Copy invite code</button>
+    </div>
+
+    <h3>Step 2: paste their reply code</h3>
+    <p>They will send you a reply code. Paste it here.</p>
+    <textarea id="reply-in" rows="5" spellcheck="false" autocomplete="off" aria-label="Reply code from the other person" placeholder="WL1...."></textarea>
+    <div class="buttons">
+      <button id="paste-reply" type="button">Paste</button>
+      <button id="btn-connect" class="primary" type="button">Connect</button>
+      <button class="cancel" type="button">Cancel</button>
+    </div>
+    <p id="host-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <!-- 2b. JOIN -->
+  <section id="screen-join" class="card" hidden>
+    <h2>Join a chat</h2>
+
+    <h3>Step 1: paste the invite code</h3>
+    <textarea id="invite-in" rows="5" spellcheck="false" autocomplete="off" aria-label="Invite code from the other person" placeholder="WL1...."></textarea>
+    <div class="buttons">
+      <button id="paste-invite" type="button">Paste</button>
+      <button id="btn-reply" class="primary" type="button">Create my reply code</button>
+      <button class="cancel" type="button">Cancel</button>
+    </div>
+
+    <div id="reply-box" hidden>
+      <h3>Step 2: send your reply code back</h3>
+      <p>Send this to the person who invited you. Keep this page open. You will connect automatically.</p>
+      <textarea id="reply-out" readonly rows="5" spellcheck="false" aria-label="Your reply code"></textarea>
+      <div class="buttons">
+        <button id="copy-reply" type="button">Copy reply code</button>
+      </div>
+    </div>
+    <p id="join-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <!-- 3. VERIFY -->
+  <section id="screen-verify" class="card" hidden>
+    <h2>Connected. Now verify.</h2>
+    <p>Check that nobody is listening in. Compare this code with the other person <strong>over a phone call or in person</strong>, not through the channel you used to swap codes. Both screens must show exactly the same thing.</p>
+    <div id="sas" class="sas" aria-live="off"></div>
+    <div class="buttons">
+      <button id="btn-match" class="primary" type="button">The codes match</button>
+      <button id="btn-nomatch" class="danger" type="button">They don't match</button>
+    </div>
+    <p class="small">If the codes differ, someone may have tampered with the connection. Don't continue.</p>
+  </section>
+
+  <!-- 4. CHAT -->
+  <section id="screen-chat" class="chat" hidden>
+    <div class="chatbar">
+      <span id="peer-state" class="pill">Waiting for the other person to confirm the codes…</span>
+      <span id="countdown" class="countdown"></span>
+      <button id="btn-end" class="danger" type="button">End and wipe</button>
+    </div>
+    <div id="messages" class="messages" role="log" aria-live="polite" aria-label="Messages"></div>
+    <form id="composer" class="composer" autocomplete="off">
+      <textarea id="msg-input" rows="2" maxlength="4000" placeholder="Type a message. Enter sends, Shift+Enter adds a new line." aria-label="Message"></textarea>
+      <button class="primary" type="submit">Send</button>
+    </form>
+    <p id="chat-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <!-- 5. ENDED -->
+  <section id="screen-ended" class="card" hidden>
+    <h2>Chat ended</h2>
+    <p id="ended-reason"></p>
+    <p>Keys and messages have been erased from this page.</p>
+    <div class="buttons">
+      <button id="btn-restart" class="primary" type="button">Start over</button>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>Messages travel directly between the two browsers, encrypted with keys that exist only in memory. Closing the tab destroys them. Both people can see each other's IP address. <a href="https://github.com/djshellshoxxx/whisper-link#how-it-works">How it works</a></p>
+</footer>
+</body>
+</html>
