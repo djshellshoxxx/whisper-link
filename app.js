@@ -10,11 +10,24 @@
  * - Messages: AES-256-GCM with a fresh key per message from a one-way HMAC ratchet (forward secrecy).
  */
 (() => {
+  // Refuse to run inside another page (clickjacking) and cut any link back to an opener (tab-napping).
+  try { window.opener = null; } catch (e) { /* ignore */ }
+  if (window.top !== window.self) {
+    document.body.textContent = 'For your safety this page will not run inside another page. Open it directly in its own browser tab.';
+    return;
+  }
+
   const PROTO = 'whisper-link/v1';
   const MAX_TEXT = 4000;
   const MAX_FRAME = 24 * 1024;
   const MAX_CODE_CHARS = 24000;
   const MAX_SDP_CHARS = 16000;
+  const MAX_DECOMPRESSED = 64 * 1024;
+  const MAX_CANDIDATES = 12;
+  const MAX_PENDING = 200;
+  const MAX_DOM_ITEMS = 500;
+  const FLOOD_WINDOW_MS = 5000;
+  const FLOOD_MAX_FRAMES = 300;
   const CONNECT_HINT_MS = 90000;
   const ICE_WAIT_MS = 6000;
   const STUN_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
@@ -47,6 +60,9 @@
     statusId: 'host-status',
     sendQ: Promise.resolve(),
     recvQ: Promise.resolve(),
+    pendingDropped: 0,
+    winStart: 0,
+    winCount: 0,
   };
 
   /* ---------- small helpers ---------- */
@@ -86,52 +102,72 @@
     else delete el.dataset.kind;
   }
 
-  const errText = (e) => (e && e.message) || String(e);
+  // Only our own fixed messages are ever shown. Browser errors can echo attacker-controlled text.
+  class UserError extends Error {}
+  const errText = (e) => (e instanceof UserError ? e.message : 'Something went wrong. Please try again, or reload the page.');
+
+  // Remove characters that can reorder or hide text (bidi overrides and isolates).
+  const stripBidi = (t) => t.replace(/[\u202A-\u202E\u2066-\u2069]/g, '');
 
   /* ---------- code (blob) packing ---------- */
 
-  async function pipeBytes(bytes, transform) {
-    const stream = new Blob([bytes]).stream().pipeThrough(transform);
-    return new Uint8Array(await new Response(stream).arrayBuffer());
+  async function pipeBytes(bytes, transform, maxOut) {
+    const reader = new Blob([bytes]).stream().pipeThrough(transform).getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > maxOut) {
+        reader.cancel();
+        throw new UserError('That code is too large.');
+      }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
   }
 
   async function packBlob(obj) {
     const raw = enc.encode(JSON.stringify(obj));
     if (typeof CompressionStream === 'function') {
-      return 'WL1.' + b64u.enc(await pipeBytes(raw, new CompressionStream('deflate-raw')));
+      return 'WL1.' + b64u.enc(await pipeBytes(raw, new CompressionStream('deflate-raw'), MAX_DECOMPRESSED));
     }
     return 'WL0.' + b64u.enc(raw);
   }
 
   async function unpackBlob(text, expectedRole) {
     const t = String(text || '').replace(/\s+/g, '');
-    if (t.length > MAX_CODE_CHARS) throw new Error('That code is too long to be a whisper-link code.');
+    if (t.length > MAX_CODE_CHARS) throw new UserError('That code is too long to be a whisper-link code.');
     const m = /^WL([01])\.([A-Za-z0-9_-]+)$/.exec(t);
-    if (!m) throw new Error("That doesn't look like a whisper-link code. Copy the whole thing, starting with WL.");
+    if (!m) throw new UserError("That doesn't look like a whisper-link code. Copy the whole thing, starting with WL.");
     let bytes;
     try {
       bytes = b64u.dec(m[2]);
       if (m[1] === '1') {
-        if (typeof DecompressionStream !== 'function') throw new Error('This browser cannot read compressed codes.');
-        bytes = await pipeBytes(bytes, new DecompressionStream('deflate-raw'));
+        if (typeof DecompressionStream !== 'function') throw new UserError('This browser cannot read compressed codes.');
+        bytes = await pipeBytes(bytes, new DecompressionStream('deflate-raw'), MAX_DECOMPRESSED);
       }
     } catch (e) {
-      throw new Error('The code is damaged or incomplete. Copy it again in full.');
+      throw new UserError(e instanceof UserError ? e.message : 'The code is damaged or incomplete. Copy it again in full.');
     }
     let obj;
     try {
       obj = JSON.parse(dec.decode(bytes));
     } catch (e) {
-      throw new Error('The code is damaged or incomplete. Copy it again in full.');
+      throw new UserError('The code is damaged or incomplete. Copy it again in full.');
     }
-    if (!obj || obj.v !== 1) throw new Error('Unsupported code version.');
+    if (!obj || obj.v !== 1) throw new UserError('Unsupported code version.');
     if (obj.r !== expectedRole) {
-      throw new Error(expectedRole === 'answer'
+      throw new UserError(expectedRole === 'answer'
         ? 'That is an invite code. Paste the reply code the other person sent you.'
         : 'That is a reply code. Paste the invite code instead.');
     }
     if (typeof obj.s !== 'string' || obj.s.length > MAX_SDP_CHARS || typeof obj.k !== 'string') {
-      throw new Error('Malformed code.');
+      throw new UserError('Malformed code.');
     }
     return obj;
   }
@@ -140,25 +176,85 @@
 
   // Returns the DTLS fingerprint of a data-channel-only SDP, or throws.
   function inspectSdp(sdp) {
-    if (!/^v=0\r?\n/.test(sdp)) throw new Error('Malformed connection data.');
+    if (!/^v=0\r?\n/.test(sdp)) throw new UserError('Malformed connection data.');
     const mLines = sdp.match(/^m=.*$/gm) || [];
     if (mLines.length !== 1 || !/^m=application /.test(mLines[0])) {
-      throw new Error('This code asks for more than a text chat (audio or video). Refusing it.');
+      throw new UserError('This code asks for more than a text chat (audio or video). Refusing it.');
     }
     const fps = new Set();
     for (const m of sdp.matchAll(/^a=fingerprint:(\S+) ([0-9A-Fa-f:]+)\s*$/gm)) {
-      if (m[1].toLowerCase() !== 'sha-256') throw new Error('Unsupported fingerprint type.');
+      if (m[1].toLowerCase() !== 'sha-256') throw new UserError('Unsupported fingerprint type.');
       fps.add(m[2].toUpperCase());
     }
-    if (fps.size !== 1) throw new Error('The code has no usable security fingerprint.');
+    if (fps.size !== 1) throw new UserError('The code has no usable security fingerprint.');
     return [...fps][0];
   }
 
   function parsePk(b64) {
     let bytes;
-    try { bytes = b64u.dec(b64); } catch (e) { throw new Error('Malformed key in code.'); }
-    if (bytes.length !== 65 || bytes[0] !== 4) throw new Error('Malformed key in code.');
+    try { bytes = b64u.dec(b64); } catch (e) { throw new UserError('Malformed key in code.'); }
+    if (bytes.length !== 65 || bytes[0] !== 4 || b64u.enc(bytes) !== b64) throw new UserError('Malformed key in code.');
     return bytes;
+  }
+
+  // Which network addresses from someone else's code are we willing to let the browser contact?
+  function addressIsSafe(addr) {
+    if (/^[0-9a-f-]{36}\.local$/i.test(addr)) return true; // browser-generated mDNS name
+    const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(addr);
+    if (v4) {
+      const o = v4.slice(1).map(Number);
+      if (o.some((x) => x > 255)) return false;
+      if (o[0] === 0 || o[0] === 127 || o[0] >= 224) return false; // unspecified, loopback, multicast, reserved
+      if (o[0] === 169 && o[1] === 254) return false;             // link-local
+      return true;
+    }
+    if (/^[0-9a-f:]{2,45}$/i.test(addr) && addr.includes(':')) {
+      const a = addr.toLowerCase();
+      return !(a === '::' || a === '::1' || a.startsWith('fe80') || a.startsWith('ff'));
+    }
+    return false; // hostnames would trigger DNS lookups
+  }
+
+  function candidateIsSafe(line) {
+    const p = line.slice('a=candidate:'.length).trim().split(/\s+/);
+    if (p.length < 8 || p[6] !== 'typ') return false;
+    const port = Number(p[5]);
+    return p[2].toLowerCase() === 'udp'
+      && ['host', 'srflx', 'prflx'].includes(p[7])
+      && Number.isInteger(port) && port >= 1024 && port <= 65535
+      && addressIsSafe(p[4]);
+  }
+
+  // Rebuild the other side's SDP keeping only what we need. Their candidate list decides which addresses
+  // our browser will probe, so it is filtered and capped. Default address/port lines are neutralised.
+  function sanitizeRemoteSdp(sdp) {
+    const out = [];
+    let kept = 0;
+    for (const line of sdp.split(/\r?\n/)) {
+      if (line === '') continue;
+      if (line.startsWith('a=candidate:')) {
+        if (kept < MAX_CANDIDATES && candidateIsSafe(line)) { out.push(line); kept++; }
+        continue;
+      }
+      if (line.startsWith('c=')) { out.push('c=IN IP4 0.0.0.0'); continue; }
+      if (line.startsWith('m=application ')) {
+        if (!/^m=application \d+ UDP\/DTLS\/SCTP webrtc-datachannel$/.test(line)) throw new UserError('Unsupported connection type in this code.');
+        out.push('m=application 9 UDP/DTLS/SCTP webrtc-datachannel');
+        continue;
+      }
+      if (line.startsWith('a=remote-candidates') || line.startsWith('a=rtcp:')) continue;
+      out.push(line);
+    }
+    if (!kept) throw new UserError('This code has no usable network address. Ask for a fresh one.');
+    return out.join('\r\n') + '\r\n';
+  }
+
+  async function applyRemote(type, sdp) {
+    try {
+      await S.pc.setRemoteDescription({ type, sdp });
+    } catch (e) {
+      throw new UserError("Your browser rejected the other side's connection data. Ask them to create a fresh code.");
+    }
   }
 
   /* ---------- crypto ---------- */
@@ -187,7 +283,7 @@
     return out.slice(0, 20).match(/.{5}/g).join(' ');
   }
 
-  async function establishKeys(peerPkB64, peerFp) {
+  async function deriveSession(peerPkB64, peerFp) {
     const isHost = S.role === 'host';
     const peerPub = parsePk(peerPkB64);
     const peerKey = await crypto.subtle.importKey('raw', peerPub, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
@@ -205,10 +301,18 @@
       { name: 'HKDF', hash: 'SHA-256', salt, info: enc.encode(PROTO + ' ' + label) }, hk, bytes * 8));
     const [sas, h2g, g2h] = await Promise.all([expand('sas', 13), expand('host-to-guest', 32), expand('guest-to-host', 32)]);
 
-    S.sas = sasString(sas);
-    S.sendChain = { key: isHost ? h2g : g2h, n: 0 };
-    S.recvChain = { key: isHost ? g2h : h2g, n: 0 };
-    S.keys.priv = null;
+    return {
+      sas: sasString(sas),
+      sendChain: { key: isHost ? h2g : g2h, n: 0 },
+      recvChain: { key: isHost ? g2h : h2g, n: 0 },
+    };
+  }
+
+  function commitSession(sess) {
+    S.sas = sess.sas;
+    S.sendChain = sess.sendChain;
+    S.recvChain = sess.recvChain;
+    S.keys.priv = null; // the ECDH private key is no longer needed; drop it for forward secrecy
   }
 
   async function hmac(keyBytes, byte) {
@@ -247,9 +351,9 @@
   }
 
   function unpad(buf) {
-    if (buf.length < 4) throw new Error('bad padding');
+    if (buf.length < 4) throw new UserError('bad padding');
     const len = new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getUint32(0);
-    if (len > buf.length - 4) throw new Error('bad padding');
+    if (len > buf.length - 4) throw new UserError('bad padding');
     return buf.subarray(4, 4 + len);
   }
 
@@ -267,10 +371,10 @@
   }
 
   async function open(frame) {
-    if (frame.length < 8 + 16 + 256 || frame.length > MAX_FRAME) throw new Error('bad frame size');
+    if (frame.length < 8 + 16 + 256 || frame.length > MAX_FRAME) throw new UserError('bad frame size');
     const aad = frame.subarray(0, 8);
     const n = Number(new DataView(frame.buffer, frame.byteOffset, 8).getBigUint64(0));
-    if (n !== S.recvChain.n) throw new Error('out-of-order or replayed message');
+    if (n !== S.recvChain.n) throw new UserError('out-of-order or replayed message');
     const { mk } = await ratchet(S.recvChain);
     const key = await crypto.subtle.importKey('raw', mk, 'AES-GCM', false, ['decrypt']);
     mk.fill(0);
@@ -316,6 +420,12 @@
     };
     ch.onmessage = (ev) => {
       if (!(ev.data instanceof ArrayBuffer)) return;
+      const now = Date.now();
+      if (now - S.winStart > FLOOD_WINDOW_MS) { S.winStart = now; S.winCount = 0; }
+      if (++S.winCount > FLOOD_MAX_FRAMES) {
+        endSession('The other side was sending data far too fast, so the chat was ended.', false);
+        return;
+      }
       const frame = new Uint8Array(ev.data);
       S.recvQ = S.recvQ.then(() => handleFrame(frame)).catch(() => {
         endSession('A message failed its security check, so the chat was ended. The connection may have been tampered with.', false);
@@ -330,6 +440,8 @@
     S.pc = null;
     S.dc = null;
     S.keys = null;
+    if (S.sendChain) S.sendChain.key.fill(0);
+    if (S.recvChain) S.recvChain.key.fill(0);
     S.sendChain = null;
     S.recvChain = null;
     S.sas = '';
@@ -357,6 +469,7 @@
       S.keys = await genKeys();
       S.ownPk = b64u.enc(S.keys.pub);
       S.pc = makePc();
+      S.pc.ondatachannel = (ev) => ev.channel.close(); // we never expect the other side to open channels
       S.dc = S.pc.createDataChannel('chat');
       wireChannel(S.dc);
       await S.pc.setLocalDescription(await S.pc.createOffer());
@@ -378,8 +491,10 @@
       const msg = await unpackBlob($('reply-in').value, 'answer');
       const peerFp = inspectSdp(msg.s);
       parsePk(msg.k);
-      await establishKeys(msg.k, peerFp);
-      await S.pc.setRemoteDescription({ type: 'answer', sdp: msg.s });
+      const safeSdp = sanitizeRemoteSdp(msg.s);
+      const sess = await deriveSession(msg.k, peerFp);
+      await applyRemote('answer', safeSdp);
+      commitSession(sess);
       setStatus('host-status', 'Connecting…');
       armConnectTimer();
     } catch (e) {
@@ -400,26 +515,31 @@
       const msg = await unpackBlob($('invite-in').value, 'offer');
       const peerFp = inspectSdp(msg.s);
       parsePk(msg.k);
+      const safeSdp = sanitizeRemoteSdp(msg.s);
 
       resetConnection();
       S.keys = await genKeys();
       S.ownPk = b64u.enc(S.keys.pub);
       S.pc = makePc();
       S.pc.ondatachannel = (ev) => {
-        if (S.dc || ev.channel.label !== 'chat') {
-          ev.channel.close();
+        const ch = ev.channel;
+        const safe = ch.label === 'chat' && ch.ordered && ch.maxRetransmits === null
+          && ch.maxPacketLifeTime === null && !ch.negotiated;
+        if (S.dc || !safe) {
+          ch.close();
+          if (!S.dc && !safe) setStatus('join-status', 'The other side tried to open an unsafe data channel, so it was refused.', 'error');
           return;
         }
-        S.dc = ev.channel;
+        S.dc = ch;
         wireChannel(S.dc);
         if (S.dc.readyState === 'open') onOpen();
       };
-      await S.pc.setRemoteDescription({ type: 'offer', sdp: msg.s });
+      await applyRemote('offer', safeSdp);
       await S.pc.setLocalDescription(await S.pc.createAnswer());
       await waitForIce(S.pc);
       const sdp = S.pc.localDescription.sdp;
       S.ownFp = inspectSdp(sdp);
-      await establishKeys(msg.k, peerFp);
+      commitSession(await deriveSession(msg.k, peerFp));
       $('reply-out').value = await packBlob({ v: 1, r: 'answer', s: sdp, k: S.ownPk });
       $('reply-box').hidden = false;
       setStatus('join-status', 'Reply code ready. Send it back and keep this page open.', 'ok');
@@ -445,7 +565,7 @@
 
   function sendCtl(obj) {
     const p = S.sendQ.then(async () => {
-      if (!S.dc || S.dc.readyState !== 'open' || !S.sendChain) throw new Error('Not connected.');
+      if (!S.dc || S.dc.readyState !== 'open' || !S.sendChain) throw new UserError('Not connected.');
       S.dc.send(await seal(obj));
     });
     S.sendQ = p.catch(() => {});
@@ -455,11 +575,12 @@
   async function handleFrame(frame) {
     if (S.ended || !S.recvChain) return;
     const m = await open(frame);
-    if (!m || typeof m.t !== 'string') throw new Error('bad message');
+    if (!m || typeof m.t !== 'string') throw new UserError('bad message');
     if (m.t === 'msg') {
-      if (typeof m.text !== 'string' || m.text.length > MAX_TEXT) throw new Error('bad text');
+      if (typeof m.text !== 'string' || m.text.length > MAX_TEXT) throw new UserError('bad text');
       if (S.verifiedMe) addMessage('them', m.text);
-      else S.pending.push({ text: m.text, at: new Date() });
+      else if (S.pending.length < MAX_PENDING) S.pending.push({ text: m.text, at: new Date() });
+      else S.pendingDropped++;
     } else if (m.t === 'verified') {
       S.verifiedPeer = true;
       updatePeerState();
@@ -471,8 +592,8 @@
   function updatePeerState() {
     const el = $('peer-state');
     if (S.verifiedPeer) {
-      el.textContent = 'Both sides verified';
-      el.dataset.kind = 'ok';
+      el.textContent = 'The other person says they confirmed the code';
+      delete el.dataset.kind;
     } else {
       el.textContent = 'Waiting for the other person to confirm the codes…';
       delete el.dataset.kind;
@@ -489,12 +610,18 @@
     wrap.className = 'msg ' + who;
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    bubble.textContent = text;
+    bubble.textContent = stripBidi(text);
     const time = document.createElement('time');
     time.textContent = fmtTime(at || new Date());
     wrap.append(bubble, time);
     list.append(wrap);
+    trimMessages();
     list.scrollTop = list.scrollHeight;
+  }
+
+  function trimMessages() {
+    const list = $('messages');
+    while (list.childElementCount > MAX_DOM_ITEMS) list.firstElementChild.remove();
   }
 
   function addSystem(text) {
@@ -502,6 +629,7 @@
     el.className = 'sys';
     el.textContent = text;
     $('messages').append(el);
+    trimMessages();
   }
 
   function confirmMatch() {
@@ -510,7 +638,9 @@
     updatePeerState();
     addSystem('Codes confirmed on your side. Messages are end-to-end encrypted.');
     for (const p of S.pending) addMessage('them', p.text, p.at);
+    if (S.pendingDropped) addSystem(S.pendingDropped + ' message(s) sent before you confirmed the code were discarded because there were too many.');
     S.pending = [];
+    S.pendingDropped = 0;
     sendCtl({ t: 'verified' }).catch(() => {});
     $('msg-input').focus();
   }
