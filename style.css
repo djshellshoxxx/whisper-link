@@ -348,3 +348,5 @@ button:focus-visible { outline: 2px solid var(--magenta); outline-offset: -5px; 
   .top h1::before, .top h1::after, .tag::after { animation: none; }
   button { transition: none; }
 }
+
+.small.warn { color: var(--magenta); }
