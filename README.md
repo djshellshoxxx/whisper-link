@@ -35,6 +35,10 @@ Temporary, end-to-end encrypted chat for **two people**. It runs entirely in the
 3. Branch **main**, folder **/ (root)**, then **Save**.
 4. After a minute the site is at `https://<your-username>.github.io/whisper-link/`.
 
+## Wiki
+
+Wiki source pages are in [docs/wiki/](docs/wiki/Home.md): architecture rationale and a codebase map.
+
 ## Files
 
 | File | Purpose |
