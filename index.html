@@ -57,7 +57,7 @@
     <h2>Start a chat</h2>
 
     <h3>Step 1: send your invite code</h3>
-    <p>Send this code to the other person.</p>
+    <p>Send this code to the other person only. It contains your network (IP) address.</p>
     <textarea id="invite-out" readonly rows="5" spellcheck="false" aria-label="Your invite code"></textarea>
     <div class="buttons">
       <button id="copy-invite" type="button">Copy invite code</button>
@@ -79,6 +79,7 @@
     <h2>Join a chat</h2>
 
     <h3>Step 1: paste the invite code</h3>
+    <p class="small warn">Only use an invite from someone you trust. Your browser will contact the network addresses listed in it, and the reply code you create contains your own IP address.</p>
     <textarea id="invite-in" rows="5" spellcheck="false" autocomplete="off" aria-label="Invite code from the other person" placeholder="WL1...."></textarea>
     <div class="buttons">
       <button id="paste-invite" type="button">Paste</button>
@@ -100,7 +101,7 @@
   <!-- 3. VERIFY -->
   <section id="screen-verify" class="card" hidden>
     <h2>Connected. Now verify.</h2>
-    <p>Check that nobody is listening in. Compare this code with the other person <strong>over a phone call or in person</strong>, not through the channel you used to swap codes. Both screens must show exactly the same thing.</p>
+    <p>Check that nobody is listening in. Compare this code with the other person <strong>over a phone call or in person</strong>, not through the channel you used to swap codes. Both screens must show exactly the same thing. Read out the <strong>whole</strong> code, not just the start.</p>
     <div id="sas" class="sas" aria-live="off"></div>
     <div class="buttons">
       <button id="btn-match" class="primary" type="button">The codes match</button>
@@ -118,7 +119,7 @@
     </div>
     <div id="messages" class="messages" role="log" aria-live="polite" aria-label="Messages"></div>
     <form id="composer" class="composer" autocomplete="off">
-      <textarea id="msg-input" rows="2" maxlength="4000" placeholder="Type a message. Enter sends, Shift+Enter adds a new line." aria-label="Message"></textarea>
+      <textarea id="msg-input" rows="2" maxlength="4000" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Type a message. Enter sends, Shift+Enter adds a new line." aria-label="Message"></textarea>
       <button class="primary" type="submit">Send</button>
     </form>
     <p id="chat-status" class="status" role="status" aria-live="polite"></p>
@@ -136,7 +137,7 @@
 </main>
 
 <footer>
-  <p>Messages travel directly between the two browsers, encrypted with keys that exist only in memory. Closing the tab destroys them. Both people can see each other's IP address. <a href="https://github.com/djshellshoxxx/whisper-link#how-it-works">How it works</a></p>
+  <p>Messages travel directly between the two browsers, encrypted with keys that exist only in memory. Closing the tab destroys them. Both people can see each other's IP address, and the codes you swap contain it too. <a href="https://github.com/djshellshoxxx/whisper-link#how-it-works" target="_blank" rel="noopener noreferrer">How it works</a></p>
 </footer>
 </body>
 </html>
